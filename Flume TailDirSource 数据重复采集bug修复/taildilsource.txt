@@ -1,0 +1,55 @@
+//判断文件是否有新文件或者已存在的文件是否有更新，返回的是一个inode的集合updatedInodes
+  public List<Long> updateTailFiles(boolean skipToEnd) throws IOException {
+    updateTime = System.currentTimeMillis();
+    List<Long> updatedInodes = Lists.newArrayList();
+    /*获取缓存中的taildir；taildirCache的数据类型是List<TaildirMatcher>--->找到TaildirMatcher构造器，有如下形参
+     (String fileGroup, String dirPath, String filePath,boolean cachePatternMatching)
+     taildir:{filegroup='f1', filePattern='/logger/flume/xxx/escmbcxxx.log', cached=true}
+     */
+    for (TaildirMatcher taildir : taildirCache) {
+      /*taildir.getFileGroup()返回的是filegroups；headerTable的数据类型是Table<String, String, String>；Table
+      类找不到...,所以暂时看不到row方法，不过可以猜到：headers头部信息存放的是组和文件的绝对路径的map集合*/
+      Map<String, String> headers = headerTable.row(taildir.getFileGroup());
+      //f是实际扫描的文件
+      for (File f : taildir.getMatchingFiles()) {//taildir.getMatchingFiles()返回的是按最后修改时间倒序的file集合
+        long inode = getInode(f); //获取文件对应的inode值
+        if (inode == -1) continue;
+        //tailFiles是map.hashmap的对象；返回的是：Map<Long, TailFile>；通过get方法，获取TailFile
+        TailFile tf = tailFiles.get(inode);  //tf就应该是TailFile(File file, Map<String, String> headers, long inode, long pos, Event bufferEvent)
+        //如果tf为空，TailFile中的绝对路径名不同于file集合中的该文件的绝对路径名
+        if (tf == null || !tf.getPath().equals(f.getAbsolutePath())) {
+          long startPos = skipToEnd ? f.length() : 0; //设置开始的pos值为0
+          tf = openFile(f, headers, inode, startPos, null); //创建一个包含该文件信息的TailFile对象
+        } else {
+          //TailFile是空值的话，里面也取不到路径，更不可能和file集合中的路径相同；所以进去else的情况只有一个
+          //TailFile有值，后面不再判断
+          boolean updated = tf.getLastUpdated() < f.lastModified() || tf.getPos() != f.length();
+          //对比TailFile中文件的最后更新时间是否小于扫描上来的file的mtime(小就证明文件有更新)||
+          //pos记录的字节数不等于该文件的实际大小--->这个作用防止仅仅往后修改了文件的mtime
+          logger.debug("File:" + tf.getPath() + ", inode:" + inode + " is updated:" + updated +
+              ", tf.getLastUpdated()=" + tf.getLastUpdated() + ", f.lastModifed()=" + f.lastModified() +
+                ", tf.getRaf()=null:" + (tf.getRaf()==null) + ", tf.getPos()=" + tf.getPos() +
+              ", f.length:" + f.length());
+          if (updated) {
+            if (tf.getRaf() == null) {  /*tf.getRaf()返回的raf --->通过RandomAccessFile类下的seek()方法，按字节获取文件的偏移位置
+                                        并且从这之后开始读取新的内容；如果这个值为空，那么无法断点续读，只能从新开始*/
+              tf.close();//自己diy的；关闭的是上面的tf，下面的是新打开的tf
+              tf = openFile(f, headers, inode, tf.getPos(), tf.getBufferEvent());//创建一个包含该文件信息的TailFile对象
+            }
+            /*正常情况下一定是新扫描过得文件一定大于TailFile中缓存的文件大小；这里做了一个异常判断，就是如果相反，新扫描的文件
+            反而比原来缓存中记录的文件字节小了，那么肯定发生了什么错误，直接重置pos*/
+            if (f.length() < tf.getPos()) {
+              logger.info("Pos " + tf.getPos() + " is larger than file size! "
+                  + "Restarting from pos 0, file: " + tf.getPath() + ", inode: " + inode +
+                      ", f.length():" + f.length());
+              tf.updatePos(tf.getPath(), inode, 0);//返回的是一个boolean，确定更新pos值
+            }
+          }
+          tf.setNeedTail(updated);/*(updated)为真。这段代码表示这个文件标记为需要tail；为假则不需要*/
+        }
+        tailFiles.put(inode, tf); //注意作用域
+        updatedInodes.add(inode);//把inode添加到updatedInodes
+      }
+    }
+    return updatedInodes;
+  }
